@@ -1,0 +1,755 @@
+"""
+Dynamic Island Control Center for Windows Surface Pro
+Features: System monitoring, Spotify control, file management, and quick access
+"""
+
+import tkinter as tk
+from tkinter import font, filedialog, messagebox
+import psutil
+import threading
+import time
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageTk
+import io
+import os
+import webbrowser
+import subprocess
+import json
+from pathlib import Path
+
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyOAuth
+    SPOTIFY_AVAILABLE = True
+except ImportError:
+    SPOTIFY_AVAILABLE = False
+
+class DynamicIsland:
+    COMPACT_SCALE = 8
+
+    def __init__(self, root):
+        self.root = root
+        self.root.attributes('-topmost', True)
+        self.root.attributes('-alpha', 0.95)
+       
+        # Configure window as frameless, always on top
+        self.root.overrideredirect(True)
+       
+        # Island dimensions (compact)
+        self.width = 220
+        self.height = 48
+        self.padding = 10
+       
+        # Position at top center
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width - self.width) // 2
+        y = self.padding
+       
+        self.root.geometry(f'{self.width}x{self.height}+{x}+{y}')
+        self.root.configure(bg='#000000')
+       
+        # Create main frame
+        self.main_frame = tk.Frame(self.root, bg='#000000')
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = None
+        self.bg_image = None
+        self.info_text_id = None
+        self.detail_text_id = None
+        self.status_dot_id = None
+        self._build_compact_ui()
+       
+        # State
+        self.current_mode = 'clock'
+        self.mode_cycle_time = 0
+        self.mode_duration = 3
+        self.expanded = False
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+       
+        # Spotify setup
+        self.spotify = None
+        self.spotify_error = None
+        self.current_track = None
+        self.is_playing = False
+        # File management
+        self.recent_files = self.load_recent_files()
+       
+        # Bind events
+        self.canvas.bind('<Button-1>', self.toggle_expand)
+        self.root.bind('<Button-3>', self.show_menu)
+        self.root.bind('<Escape>', lambda e: self.toggle_expand() if self.expanded else None)
+       
+        # Start update thread
+        self.running = True
+        self.update_thread = threading.Thread(target=self.update_loop, daemon=True)
+        self.update_thread.start()
+       
+    def draw_island_background(self):
+        """Draw the island background with rounded corners."""
+        self.canvas.delete('bg')
+        scale = self.COMPACT_SCALE
+        img = Image.new('RGBA', (self.width * scale, self.height * scale), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Draw a clean rectangular cutout, then downsample to keep the edges crisp.
+        pad = 2 * scale
+        left = pad
+        top = pad
+        right = self.width * scale - pad
+        bottom = self.height * scale - pad
+
+        fill = (6, 6, 6, 255)
+        outline = (35, 35, 35, 255)
+        draw.rectangle([left, top, right, bottom], fill=fill, outline=outline, width=scale)
+
+        # A subtle highlight band gives the island depth without rounded corners.
+        highlight = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        hdraw = ImageDraw.Draw(highlight)
+        hdraw.rectangle([left + scale, top + scale, right - scale, top + (self.height * scale) // 2], fill=(255, 255, 255, 14))
+        img = Image.alpha_composite(img, highlight)
+
+        # Centered rectangular notch cutout.
+        notch_w = int(self.width * scale * 0.34)
+        notch_h = int(self.height * scale * 0.60)
+        notch_left = (self.width * scale - notch_w) // 2
+        notch_top = (self.height * scale - notch_h) // 2
+        notch_right = notch_left + notch_w
+        notch_bottom = notch_top + notch_h
+        draw.rectangle([notch_left, notch_top, notch_right, notch_bottom], fill=(0, 0, 0, 255))
+
+        # Subtle edge shading so the rectangle looks intentional rather than clipped.
+        draw.rectangle([notch_left - scale, notch_top - scale, notch_right + scale, notch_bottom + scale], outline=(22, 22, 22, 255), width=scale)
+
+        img = img.resize((self.width, self.height), Image.Resampling.LANCZOS)
+        self.bg_image = ImageTk.PhotoImage(img)
+        self.canvas.create_image(0, 0, image=self.bg_image, anchor='nw', tags='bg')
+
+    def _clear_main_frame(self):
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+
+    def _build_compact_ui(self):
+        self._clear_main_frame()
+
+        self.canvas = tk.Canvas(
+            self.main_frame,
+            width=self.width,
+            height=self.height,
+            bg='#000000',
+            highlightthickness=0,
+            bd=0
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.draw_island_background()
+
+        center_x = self.width / 2
+        center_y = self.height / 2
+        self.status_dot_id = self.canvas.create_oval(
+            center_x - 70, center_y - 4, center_x - 62, center_y + 4,
+            fill='#1DB954', outline='', tags='content'
+        )
+        self.info_text_id = self.canvas.create_text(
+            center_x,
+            center_y - 1,
+            text='',
+            fill='#FFFFFF',
+            font=('Segoe UI', 11, 'bold'),
+            anchor='center',
+            tags='content'
+        )
+        self.detail_text_id = self.canvas.create_text(
+            center_x,
+            center_y + 11,
+            text='',
+            fill='#B0B0B0',
+            font=('Segoe UI', 7),
+            anchor='center',
+            tags='content'
+        )
+
+        self.canvas.tag_bind('content', '<Button-1>', self.toggle_expand)
+        self.canvas.bind('<Button-1>', self.toggle_expand)
+
+    def _set_compact_status(self, primary, secondary=''):
+        if self.canvas is None:
+            return
+
+        self.canvas.itemconfigure(self.info_text_id, text=primary)
+        self.canvas.itemconfigure(self.detail_text_id, text=secondary)
+
+        if primary.lower().startswith('spotify'):
+            dot_color = '#1DB954'
+        elif primary.startswith('CPU'):
+            dot_color = '#F6C945'
+        elif primary.startswith('🔋') or primary.startswith('🔌'):
+            dot_color = '#66D17A'
+        else:
+            dot_color = '#6EA8FF'
+
+        self.canvas.itemconfigure(self.status_dot_id, fill=dot_color)
+
+        # Keep the text visually centered by placing it on the middle axis.
+        self.canvas.coords(self.info_text_id, self.width / 2, self.height / 2 - 1)
+        self.canvas.coords(self.detail_text_id, self.width / 2, self.height / 2 + 11)
+        self.canvas.coords(self.status_dot_id, self.width / 2 - 70, self.height / 2 - 4, self.width / 2 - 62, self.height / 2 + 4)
+
+    def _shorten(self, text, limit):
+        text = text.strip()
+        return text if len(text) <= limit else text[:max(0, limit - 1)].rstrip() + '…'
+
+    def open_spotify_app(self):
+        """Open the Spotify desktop app or its URI handler."""
+        try:
+            os.startfile('spotify:')
+        except Exception:
+            webbrowser.open('spotify:')
+
+    def get_desktop_path(self):
+        """Resolve the actual desktop folder, including OneDrive-backed desktops."""
+        home = Path.home()
+        candidates = [
+            home / 'Desktop',
+            home / 'OneDrive' / 'Desktop',
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+        for candidate in home.glob('OneDrive*'):
+            desktop = candidate / 'Desktop'
+            if desktop.exists():
+                return str(desktop)
+
+        return str(home / 'Desktop')
+   
+    def update_loop(self):
+        """Main update loop"""
+        while self.running:
+            self.mode_cycle_time += 0.5
+           
+            # Cycle through modes
+            if self.mode_cycle_time >= self.mode_duration:
+                modes = ['clock', 'spotify', 'battery', 'cpu']
+                idx = int(self.mode_cycle_time / self.mode_duration) % len(modes)
+                self.current_mode = modes[idx]
+           
+            self.update_display()
+            time.sleep(0.5)
+   
+    def update_display(self):
+        """Update the island display"""
+        if self.expanded:
+            return
+        try:
+            if self.current_mode == 'clock':
+                self.show_time()
+            elif self.current_mode == 'spotify':
+                self.show_spotify()
+            elif self.current_mode == 'battery':
+                self.show_battery()
+            elif self.current_mode == 'cpu':
+                self.show_cpu()
+        except Exception as e:
+            print(f"Display error: {e}")
+   
+    def show_time(self):
+        """Display current time"""
+        now = datetime.now()
+        time_str = now.strftime('%H:%M')
+        date_str = now.strftime('%A')
+       
+        self._set_compact_status(time_str, date_str)
+   
+    def show_spotify(self):
+        """Display current Spotify track"""
+        self._set_compact_status('Spotify', 'Open app')
+   
+    def show_battery(self):
+        """Display battery status"""
+        battery = psutil.sensors_battery()
+        if battery:
+            percent = battery.percent
+            status = '🔌' if battery.power_plugged else '🔋'
+            self._set_compact_status(f'{status} {percent:.0f}%')
+            time_left = battery.secsleft if hasattr(battery, 'secsleft') else 0
+            if time_left > 0:
+                hours = time_left // 3600
+                mins = (time_left % 3600) // 60
+                self._set_compact_status(f'{status} {percent:.0f}%', f'{hours}h {mins}m remaining')
+            else:
+                self._set_compact_status(f'{status} {percent:.0f}%', 'Battery')
+   
+    def show_cpu(self):
+        """Display CPU and memory usage"""
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+        self._set_compact_status(f'CPU {cpu_percent:.0f}%', f'RAM {mem.percent:.0f}%')
+   
+    def toggle_expand(self, event=None):
+        """Toggle between compact and expanded view"""
+        self.expanded = not self.expanded
+        if self.expanded:
+            self.show_control_center()
+        else:
+            self._build_compact_ui()
+            self._center_compact_window()
+            self.root.minsize(self.width, self.height)
+            self.root.maxsize(self.width, self.height)
+            self.root.attributes('-topmost', True)
+            self.root.overrideredirect(True)
+
+    def _center_compact_window(self):
+        """Reposition the compact island to the screen center."""
+        width, height, x, y = self._compact_geometry()
+        self.root.deiconify()
+        self.root.update_idletasks()
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+        self.root.after(0, lambda: self.root.geometry(f'{width}x{height}+{x}+{y}'))
+        self.root.lift()
+
+    def _compact_geometry(self):
+        """Return the centered compact geometry."""
+        screen_width = self.root.winfo_screenwidth()
+        x = max(20, (screen_width - self.width) // 2)
+        return self.width, self.height, x, self.padding
+
+    def _expanded_geometry(self):
+        """Return a centered, notch-friendly geometry for the expanded window."""
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(900, screen_width - 80)
+        height = min(640, screen_height - 120)
+        x = max(20, (screen_width - width) // 2)
+        y = max(20, (screen_height - height) // 2)
+        return width, height, x, y
+   
+    def show_control_center(self):
+        """Show expanded control center"""
+        # Make window normal for taskbar
+        self.root.overrideredirect(False)
+        self.root.state('normal')
+        self.root.attributes('-topmost', False)
+
+        width, height, x, y = self._expanded_geometry()
+        self.root.minsize(width, height)
+        self.root.maxsize(width, height)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+        self.root.title('Dynamic Control Center')
+       
+        # Clear compact island UI before building the larger controls.
+        self._clear_main_frame()
+       
+        # Create notebook-like tabs
+        tab_frame = tk.Frame(self.main_frame, bg='#1a1a1a')
+        tab_frame.pack(fill=tk.X, padx=10, pady=10)
+       
+        # Tab buttons
+        tabs = ['System', 'Spotify', 'Files', 'Quick Access']
+        tab_buttons = {}
+        for i, tab in enumerate(tabs):
+            btn = tk.Button(
+                tab_frame,
+                text=tab,
+                bg='#333333' if i == 0 else '#1a1a1a',
+                fg='#FFFFFF',
+                border=0,
+                padx=15,
+                pady=10,
+                font=('Segoe UI', 10, 'bold'),
+                command=lambda t=i: self.show_tab(t, tab_buttons)
+            )
+            btn.pack(side=tk.LEFT, padx=5)
+            tab_buttons[i] = btn
+       
+        # Content frame
+        self.content_frame = tk.Frame(self.main_frame, bg='#000000')
+        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+       
+        # Show first tab
+        self.show_tab(0, tab_buttons)
+
+    def open_vscode(self):
+        """Open Visual Studio Code if it is installed."""
+        candidates = [
+            os.path.expandvars(r'%LocalAppData%\\Programs\\Microsoft VS Code\\Code.exe'),
+            os.path.expandvars(r'%ProgramFiles%\\Microsoft VS Code\\Code.exe'),
+            os.path.expandvars(r'%ProgramFiles(x86)%\\Microsoft VS Code\\Code.exe'),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                os.startfile(candidate)
+                return
+        try:
+            os.startfile('vscode:')
+        except Exception:
+            webbrowser.open('vscode://')
+
+    def add_close_button(self, parent):
+        """Add a consistent close control to each page."""
+        close_btn = tk.Button(
+            parent,
+            text='✕ Close Control Centre',
+            command=self.toggle_expand,
+            bg='#FF6B6B',
+            fg='#FFFFFF',
+            font=('Segoe UI', 10, 'bold'),
+            padx=12,
+            pady=8,
+            border=0,
+            cursor='hand2'
+        )
+        close_btn.pack(side=tk.BOTTOM, pady=(10, 0))
+        return close_btn
+   
+    def show_tab(self, tab_idx, buttons):
+        """Show specific tab content"""
+        # Update button colors
+        for i, btn in buttons.items():
+            btn.config(bg='#333333' if i == tab_idx else '#1a1a1a')
+       
+        # Clear content
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+       
+        if tab_idx == 0:
+            self.show_system_tab()
+        elif tab_idx == 1:
+            self.show_spotify_tab()
+        elif tab_idx == 2:
+            self.show_files_tab()
+        elif tab_idx == 3:
+            self.show_quick_access_tab()
+   
+    def show_system_tab(self):
+        """System information tab"""
+        page = tk.Frame(self.content_frame, bg='#000000')
+        page.pack(fill=tk.BOTH, expand=True)
+
+        cpu = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        battery = psutil.sensors_battery()
+       
+        title = tk.Label(
+            page,
+            text='System Status',
+            fg='#FFFFFF',
+            bg='#000000',
+            font=('Segoe UI', 17, 'bold')
+        )
+        title.pack(pady=(10, 14))
+       
+        # System info
+        info_text = f"""
+CPU Usage:        {cpu:.1f}%
+Memory:           {mem.percent:.1f}% ({mem.used // (1024**3)}GB / {mem.total // (1024**3)}GB)
+Disk:             {disk.percent:.1f}% ({disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB)
+Battery:          {battery.percent:.0f}% {'🔌 Charging' if battery.power_plugged else '🔋 Discharging'}
+Time:             {datetime.now().strftime('%H:%M:%S')}
+        """
+       
+        info = tk.Label(
+            page,
+            text=info_text,
+            fg='#CCCCCC',
+            bg='#000000',
+            font=('Segoe UI', 13),
+            justify=tk.CENTER,
+            anchor='center'
+        )
+        info.pack(pady=10)
+        self.add_close_button(page)
+   
+    def show_spotify_tab(self):
+        """Spotify control tab"""
+        page = tk.Frame(self.content_frame, bg='#000000')
+        page.pack(fill=tk.BOTH, expand=True)
+
+        title = tk.Label(
+            page,
+            text='🎵 Spotify Control',
+            fg='#FFFFFF',
+            bg='#000000',
+            font=('Segoe UI', 14, 'bold')
+        )
+        title.pack(pady=10)
+       
+        if not self.spotify:
+            status_text = 'Open the Spotify app.'
+            no_spotify = tk.Label(
+                page,
+                text=status_text,
+                fg='#FF6B6B',
+                bg='#000000',
+                font=('Segoe UI', 10)
+            )
+            no_spotify.pack(pady=20)
+
+            open_btn = tk.Button(
+                page,
+                text='Open Spotify App',
+                command=self.open_spotify_app,
+                bg='#1DB954',
+                fg='#000000',
+                font=('Segoe UI', 10, 'bold'),
+                padx=12,
+                pady=8,
+                border=0,
+                cursor='hand2'
+            )
+            open_btn.pack(pady=10)
+            self.add_close_button(page)
+            return
+
+        spotify_btn = tk.Button(
+            page,
+            text='Open Spotify App',
+            command=self.open_spotify_app,
+            bg='#1DB954',
+            fg='#000000',
+            font=('Segoe UI', 10, 'bold'),
+            padx=12,
+            pady=8,
+            border=0,
+            cursor='hand2'
+        )
+        spotify_btn.pack(pady=20)
+        self.add_close_button(page)
+
+    def show_spotify_status(self):
+        """Force the compact view to reflect Spotify state immediately."""
+        self._set_compact_status('Spotify', 'Open app')
+   
+    def show_files_tab(self):
+        """File manager tab"""
+        page = tk.Frame(self.content_frame, bg='#000000')
+        page.pack(fill=tk.BOTH, expand=True)
+
+        title = tk.Label(
+            page,
+            text='📁 Files',
+            fg='#FFFFFF',
+            bg='#000000',
+            font=('Segoe UI', 14, 'bold')
+        )
+        title.pack(pady=10)
+       
+        # Quick folders
+        folders_frame = tk.Frame(page, bg='#000000')
+        folders_frame.pack(pady=10)
+       
+        quick_folders = [
+            ('📂 Documents', os.path.expanduser('~/Documents')),
+            ('📥 Downloads', os.path.expanduser('~/Downloads')),
+            ('🖥️ Desktop', self.get_desktop_path()),
+        ]
+       
+        btn_style = {'bg': '#333333', 'fg': '#FFFFFF', 'font': ('Segoe UI', 9),
+                     'padx': 10, 'pady': 8, 'border': 0, 'cursor': 'hand2'}
+       
+        for label, path in quick_folders:
+            btn = tk.Button(
+                folders_frame,
+                text=label,
+                command=lambda p=path: self.open_folder(p),
+                **btn_style
+            )
+            btn.pack(side=tk.LEFT, padx=5)
+       
+        # Recent files
+        recent_label = tk.Label(
+            page,
+            text='Recent Files:',
+            fg='#CCCCCC',
+            bg='#000000',
+            font=('Segoe UI', 10, 'bold')
+        )
+        recent_label.pack(pady=(20, 10), anchor=tk.W, padx=10)
+       
+        # List recent files
+        if self.recent_files:
+            for file_path in self.recent_files[:5]:
+                file_name = os.path.basename(file_path)
+                file_btn = tk.Button(
+                    page,
+                    text=f'  📄 {file_name}',
+                    command=lambda f=file_path: self.open_file(f),
+                    bg='#1a1a1a',
+                    fg='#89CFF0',
+                    font=('Segoe UI', 9),
+                    anchor=tk.W,
+                    padx=10,
+                    pady=5,
+                    border=0,
+                    cursor='hand2'
+                )
+                file_btn.pack(fill=tk.X, padx=10, pady=2)
+        else:
+            no_files = tk.Label(
+                page,
+                text='No recent files',
+                fg='#666666',
+                bg='#000000',
+                font=('Segoe UI', 9)
+            )
+            no_files.pack(pady=10)
+       
+        # Add file button
+        add_btn = tk.Button(
+            page,
+            text='➕ Add File',
+            command=self.add_recent_file,
+            bg='#1DB954',
+            fg='#000000',
+            font=('Segoe UI', 10, 'bold'),
+            padx=10,
+            pady=8,
+            border=0,
+            cursor='hand2'
+        )
+        add_btn.pack(pady=15)
+        self.add_close_button(page)
+   
+    def show_quick_access_tab(self):
+        """Quick access shortcuts"""
+        page = tk.Frame(self.content_frame, bg='#000000')
+        page.pack(fill=tk.BOTH, expand=True)
+
+        title = tk.Label(
+            page,
+            text='⚡ Quick Access',
+            fg='#FFFFFF',
+            bg='#000000',
+            font=('Segoe UI', 14, 'bold')
+        )
+        title.pack(pady=10)
+       
+        quick_actions = [
+            ('🔧 Settings', lambda: os.startfile('ms-settings:')),
+            ('🌐 Browser', lambda: webbrowser.open('https://google.com')),
+            ('🎨 Color Settings', lambda: os.startfile('ms-settings:colors')),
+            ('📊 Task Manager', lambda: os.system('taskmgr')),
+            ('🔊 Volume', lambda: subprocess.Popen(['sndvol.exe'])),
+            ('📺 Display', lambda: os.startfile('ms-settings:display')),
+            ('🧮 Calculator', lambda: subprocess.Popen(['calc.exe'])),
+            ('🧑‍💻 Open VS Code', self.open_vscode),
+        ]
+       
+        grid_outer = tk.Frame(page, bg='#000000')
+        grid_outer.pack(fill=tk.BOTH, expand=True)
+
+        grid_frame = tk.Frame(grid_outer, bg='#000000')
+        grid_frame.place(relx=0.5, rely=0.5, anchor='center')
+       
+        btn_style = {'bg': '#333333', 'fg': '#FFFFFF', 'font': ('Segoe UI', 10),
+                 'padx': 8, 'pady': 8, 'border': 0, 'cursor': 'hand2', 'width': 14}
+       
+        for i, (label, command) in enumerate(quick_actions):
+            row = i // 3
+            col = i % 3
+            btn = tk.Button(grid_frame, text=label, command=command, **btn_style)
+            btn.grid(row=row, column=col, padx=6, pady=6, sticky='ew')
+
+        for col in range(3):
+            grid_frame.grid_columnconfigure(col, weight=1)
+       
+        self.add_close_button(page)
+   
+    def spotify_toggle_play(self):
+        """Toggle Spotify playback"""
+        if self.spotify:
+            try:
+                if self.is_playing:
+                    self.spotify.pause_playback()
+                else:
+                    self.spotify.start_playback()
+            except:
+                pass
+   
+    def spotify_next(self):
+        """Skip to next track"""
+        if self.spotify:
+            try:
+                self.spotify.next_track()
+            except:
+                pass
+   
+    def spotify_previous(self):
+        """Go to previous track"""
+        if self.spotify:
+            try:
+                self.spotify.previous_track()
+            except:
+                pass
+   
+    def open_folder(self, path):
+        """Open folder in explorer"""
+        os.startfile(path)
+   
+    def open_file(self, path):
+        """Open file with default application"""
+        if os.path.exists(path):
+            os.startfile(path)
+   
+    def add_recent_file(self):
+        """Add file to recent list"""
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            if file_path not in self.recent_files:
+                self.recent_files.insert(0, file_path)
+                self.recent_files = self.recent_files[:10]  # Keep last 10
+                self.save_recent_files()
+   
+    def load_recent_files(self):
+        """Load recent files from cache"""
+        try:
+            if os.path.exists('recent_files.json'):
+                with open('recent_files.json', 'r') as f:
+                    return json.load(f)
+        except:
+            pass
+        return []
+   
+    def save_recent_files(self):
+        """Save recent files to cache"""
+        try:
+            with open('recent_files.json', 'w') as f:
+                json.dump(self.recent_files, f)
+        except:
+            pass
+   
+    def show_menu(self, event=None):
+        """Show context menu"""
+        menu = tk.Menu(self.root, tearoff=0, bg='#333333', fg='#FFFFFF')
+        menu.add_command(label='📌 Always on Top', command=self.toggle_topmost)
+        menu.add_command(label='🎵 Open Spotify', command=self.open_spotify_app)
+        menu.add_command(label='🔄 Refresh', command=lambda: None)
+        menu.add_separator()
+        menu.add_command(label='❌ Exit', command=self.close)
+       
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        except:
+            pass
+   
+    def toggle_topmost(self):
+        """Toggle always-on-top"""
+        current = self.root.attributes('-topmost')
+        self.root.attributes('-topmost', not current)
+   
+    def close(self):
+        """Close the application"""
+        self.running = False
+        self.root.quit()
+
+def main():
+    root = tk.Tk()
+    root.title('Dynamic Island')
+    island = DynamicIsland(root)
+    root.update_idletasks()
+    root.lift()
+    root.after(100, root.lift)
+    root.mainloop()
